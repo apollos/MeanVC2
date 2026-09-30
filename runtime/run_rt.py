@@ -15,6 +15,10 @@ Usage:
 
   # Realtime mode
   python run_rt.py --mode realtime --model 40ms [--device cuda]
+
+  # Realtime mode with converted playback recorded to a WAV file
+  python run_rt.py --mode realtime --model 120ms --device cuda \
+      --record-output recordings/meanvc2.wav
 """
 
 from __future__ import annotations
@@ -22,7 +26,9 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import queue
 import sys
+import threading
 import time
 from pathlib import Path
 
@@ -458,7 +464,12 @@ def _load_vc_model(config_path: str, ckpt_path: str, device: str = "cpu") -> DiT
 # Realtime mode
 # ---------------------------------------------------------------------------
 
-def run_realtime(vc: VCRunner, in_device: int | None = None, out_device: int | None = None):
+def run_realtime(
+    vc: VCRunner,
+    in_device: int | None = None,
+    out_device: int | None = None,
+    record_output: str | None = None,
+):
     try:
         import sounddevice as sd
     except ImportError:
@@ -469,6 +480,55 @@ def run_realtime(vc: VCRunner, in_device: int | None = None, out_device: int | N
     chunk_count = 0
     last_print_chunk = -1
     out_buffer = np.array([], dtype=np.float32)
+    sample_rate = 16000
+
+    # Writing a WAV can block briefly, so keep disk I/O out of PortAudio's
+    # callback.  The callback only copies exactly what is sent to the output
+    # device; a background thread performs the actual file writes.
+    record_queue = None
+    record_thread = None
+    record_stop = object()
+    record_ready = threading.Event()
+    record_error: list[BaseException] = []
+    recorded_samples = 0
+
+    if record_output:
+        import soundfile as sf
+
+        record_path = Path(record_output).expanduser().resolve()
+        record_path.parent.mkdir(parents=True, exist_ok=True)
+        record_queue = queue.SimpleQueue()
+
+        def record_worker():
+            nonlocal recorded_samples
+            try:
+                # PCM_24 keeps substantially more precision than the default
+                # PCM_16 while remaining a widely supported WAV format.
+                with sf.SoundFile(
+                    str(record_path), mode="w", samplerate=sample_rate,
+                    channels=1, format="WAV", subtype="PCM_24",
+                ) as wav_file:
+                    record_ready.set()
+                    while True:
+                        block = record_queue.get()
+                        if block is record_stop:
+                            break
+                        wav_file.write(block)
+                        recorded_samples += len(block)
+            except BaseException as exc:
+                record_error.append(exc)
+                record_ready.set()
+
+        record_thread = threading.Thread(
+            target=record_worker, name="meanvc-wav-writer", daemon=True
+        )
+        record_thread.start()
+        record_ready.wait()
+        if record_error:
+            raise RuntimeError(
+                f"Unable to open real-time recording file: {record_path}"
+            ) from record_error[0]
+        print(f"[Record] Saving converted output to: {record_path}")
 
     def audio_callback(indata, outdata, frames, time_info, status):
         nonlocal chunk_count, last_print_chunk, out_buffer
@@ -493,6 +553,10 @@ def run_realtime(vc: VCRunner, in_device: int | None = None, out_device: int | N
             outdata[n_avail:, 0] = 0.0
             out_buffer = np.array([], dtype=np.float32)
 
+        if record_queue is not None and not record_error:
+            # Save the exact mono block delivered to the playback device.
+            record_queue.put(outdata[:, 0].copy())
+
         chunk_count += 1
         proc_ms = (t1 - t0) * 1000
         chunk_ms = len(samples) / 16
@@ -503,7 +567,6 @@ def run_realtime(vc: VCRunner, in_device: int | None = None, out_device: int | N
             last_print_chunk = chunk_count
 
     print("\n[Stream] Using sounddevice for real-time I/O")
-    sample_rate = 16000
     blocksize = vc.CHUNK
 
     print("[Stream] Warming up...")
@@ -524,6 +587,16 @@ def run_realtime(vc: VCRunner, in_device: int | None = None, out_device: int | N
                 sd.sleep(1000)
     except KeyboardInterrupt:
         print("\n[Stream] Stopped by user.")
+    finally:
+        if record_queue is not None:
+            record_queue.put(record_stop)
+        if record_thread is not None:
+            record_thread.join()
+        if record_error:
+            print(f"[Record] ERROR: {record_error[0]}")
+        elif record_output:
+            duration = recorded_samples / sample_rate
+            print(f"[Record] Saved {duration:.1f}s to: {record_path}")
 
 
 # ---------------------------------------------------------------------------
@@ -539,6 +612,10 @@ def main():
     parser.add_argument("--input", type=str, default=None, help="Input WAV (file mode)")
     parser.add_argument("--output", type=str, default="output_vc.wav", help="Output WAV (file mode)")
     parser.add_argument("--seed", type=int, default=42, help="Random seed (file mode)")
+    parser.add_argument(
+        "--record-output", type=str, default=None,
+        help="Save real-time converted playback to this WAV file (realtime mode)",
+    )
     args = parser.parse_args()
 
     print("=" * 50)
@@ -548,12 +625,14 @@ def main():
     print(f"  Model:      {args.model} ({MODEL_PATHS[args.model]['config']})")
     print(f"  Target spk: {args.target_spk}")
     print(f"  Mode:       {args.mode}")
+    if args.mode == "realtime" and args.record_output:
+        print(f"  Recording:  {args.record_output}")
     print("=" * 50)
 
     vc = VCRunner(target_wav=args.target_spk, device=args.device, model=args.model)
 
     if args.mode == "realtime":
-        run_realtime(vc)
+        run_realtime(vc, record_output=args.record_output)
     elif args.mode == "file":
         if not args.input:
             print("ERROR: --input required for file mode")
